@@ -137,6 +137,33 @@ def is_shared_expert_quant_fse_compatible(
             f"DeepSeek-V4 shared experts at {shared_expert_prefix} are not MXFP4",
         )
 
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    if isinstance(quant_config, Fp8Config):
+        # Plain FP8 quantizes routed and shared experts with the same scheme,
+        # so fusion is compatible unless the shared-expert projections are
+        # exempted from quantization.
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            is_layer_skipped,
+        )
+
+        shared_expert_skipped = any(
+            is_layer_skipped(
+                prefix=f"{shared_expert_prefix}.{projection_name}",
+                ignored_layers=quant_config.ignored_layers or [],
+                fused_mapping=quant_config.packed_modules_mapping,
+                match_mode=quant_config.ignored_layers_match_mode,
+            )
+            for projection_name in projection_names
+        )
+        if shared_expert_skipped:
+            return (
+                False,
+                "Fp8Config leaves shared experts unquantized at "
+                f"{shared_expert_prefix}",
+            )
+        return True, None
+
     if isinstance(quant_config, QuarkConfig):
         # TODO: layer_type_quant_config is not taken into account here.
         assert "exclude" in quant_config.quant_config
