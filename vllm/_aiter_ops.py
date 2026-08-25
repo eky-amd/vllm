@@ -790,17 +790,19 @@ def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl(
     As: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype = torch.float16,
+    scale_transposed: bool = False,
 ) -> torch.Tensor:
     from aiter import gemm_a8w8_blockscale_bpreshuffle
 
     # B preshuffled (shuffle_weight (16,16)). The kernel reads the activation
-    # group scales column-major; convert HERE, inside the op impl, so the
-    # layout survives torch.compile: a caller-side strided transpose is not
-    # guaranteed to reach a custom op intact (inductor may normalize inputs
-    # to contiguous, silently undoing it — observed as model-level numeric
-    # corruption). A contiguous tensor with column-major data is preserved.
-    m, g = As.shape
-    As = As.transpose(0, 1).contiguous().view(m, g)
+    # group scales column-major: shape [M, G], contiguous, holding the bytes of
+    # As.T (the same layout AITER's quant producers emit with
+    # transpose_scale=True). If the producer already emitted that layout the
+    # caller passes scale_transposed=True and As goes straight through;
+    # otherwise convert here, inside the op impl (torch.compile-safe).
+    if not scale_transposed:
+        m, g = As.shape
+        As = As.transpose(0, 1).contiguous().view(m, g)
     return gemm_a8w8_blockscale_bpreshuffle(A, B, As, Bs, dtype=output_dtype)
 
 
@@ -810,6 +812,7 @@ def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake(
     As: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype = torch.float16,
+    scale_transposed: bool = False,
 ) -> torch.Tensor:
     m = A.shape[0]
     n = B.shape[0]
@@ -945,12 +948,56 @@ def _rocm_aiter_fused_allreduce_rmsnorm_fake(
     return torch.empty_like(input_), torch.empty_like(residual)
 
 
+def _aiter_fused_ar_rms_per_group_quant_transposed(
+    ca,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_size: int,
+    use_1stage: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """aiter's ``fused_ar_rms_per_group_quant`` launcher with the C++
+    ``transpose_scale`` flag (exposed by the pybind but not by the Python
+    launcher): the scale buffer keeps shape [M, G] but holds the bytes of
+    scale.T, the layout the CK b-preshuffle blockscale GEMM consumes."""
+    import aiter as aiter_ops
+
+    K = inp.shape[-1]
+    res_out = torch.empty_like(inp)
+    out = torch.empty(inp.shape, dtype=FP8_DTYPE, device=inp.device)
+    scale_out = torch.empty(
+        inp.shape[:-1] + (K // group_size,), dtype=torch.float32, device=inp.device
+    )
+    registered = torch.cuda.is_current_stream_capturing()
+    reg = 0 if registered else ca._pool["input"].data_ptr
+    reg_bytes = 0 if registered else ca._pool["input"].max_size
+    aiter_ops.fused_allreduce_rmsnorm_quant_per_group(
+        ca._ptr,
+        inp,
+        res_inp,
+        res_out,
+        out,
+        scale_out,
+        w,
+        eps,
+        group_size,
+        reg,
+        reg_bytes,
+        use_1stage,
+        0,
+        True,
+    )
+    return out, res_out, scale_out
+
+
 def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
     input_: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused AllReduce + RMSNorm + per-group FP8 quant.
 
@@ -985,15 +1032,20 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
 
     use_1stage = hidden_ok and token_ok and size_ok
 
-    result = ca.fused_ar_rms_per_group_quant(
-        input_,
-        residual,
-        w=weight,
-        eps=epsilon,
-        group_size=group_size,
-        registered=torch.cuda.is_current_stream_capturing(),
-        use_1stage=use_1stage,
-    )
+    if transpose_scale:
+        result = _aiter_fused_ar_rms_per_group_quant_transposed(
+            ca, input_, residual, weight, epsilon, group_size, use_1stage
+        )
+    else:
+        result = ca.fused_ar_rms_per_group_quant(
+            input_,
+            residual,
+            w=weight,
+            eps=epsilon,
+            group_size=group_size,
+            registered=torch.cuda.is_current_stream_capturing(),
+            use_1stage=use_1stage,
+        )
     assert result is not None
     return result[0], result[1], result[2]
 
@@ -1004,6 +1056,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_fake(
     weight: torch.Tensor,
     epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hidden_dim = input_.shape[-1]
     num_groups = hidden_dim // group_size
@@ -1155,6 +1208,7 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -1168,6 +1222,7 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
         group_size=group_size,
         dtype_quant=FP8_DTYPE,
         res1=residual,
+        transpose_scale=transpose_scale,
     )
     return (
         x_quant,
@@ -1182,6 +1237,7 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N = x.shape
     scale_shape = (M, (N + group_size - 1) // group_size)
@@ -1197,6 +1253,7 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_impl(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -1210,6 +1267,7 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_impl(
         group_size=group_size,
         dtype_quant=FP8_DTYPE,
         res1=None,
+        transpose_scale=transpose_scale,
     )
     return (x_quant, x_quant_scales)
 
@@ -1219,6 +1277,7 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
     weight: torch.Tensor,
     variance_epsilon: float,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
     scale_shape = (M, (N + group_size - 1) // group_size)
@@ -1307,20 +1366,27 @@ def _rocm_aiter_group_fp8_quant_fake(
 def _rocm_aiter_act_mul_and_fp8_group_quant_impl(
     x: torch.Tensor,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
 
-    return act_mul_and_fp8_group_quant(
+    out, scale = act_mul_and_fp8_group_quant(
         x,
         activation="silu",
         group_size=group_size,
         dtype_quant=FP8_DTYPE,
     )
+    if transpose_scale:
+        # aiter's act+quant kernel has no transposed-scale mode; emit the
+        # column-major-bytes layout here (dense-MLP layers only).
+        scale = scale.transpose(0, 1).contiguous().view(scale.shape)
+    return out, scale
 
 
 def _rocm_aiter_act_mul_and_fp8_group_quant_fake(
     x: torch.Tensor,
     group_size: int,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
     assert N % 2 == 0
@@ -2444,9 +2510,10 @@ class rocm_aiter_ops:
         As: torch.Tensor,
         Bs: torch.Tensor,
         output_dtype: torch.dtype = torch.float16,
+        scale_transposed: bool = False,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale_bpreshuffle(
-            A, B, As, Bs, output_dtype
+            A, B, As, Bs, output_dtype, scale_transposed
         )
 
     @staticmethod
