@@ -171,18 +171,40 @@ def is_aiter_found_and_supported_on_rdna4() -> bool:
 
 @functools.cache
 def _load_gemm_tuned_configs(
-    q_dtype_w: torch.dtype, csv_path: str
+    q_dtype_w: torch.dtype | None, csv_path: str, match_device: bool = False
 ) -> set[tuple[int, int, int]]:
+    """(N, K, M) triples with a tuned row in an AITER GEMM CSV.
+
+    q_dtype_w filters the ``q_dtype_w`` column when given and present (the
+    block-scale tables have no such column). match_device restricts to rows
+    tuned for this GPU (``gfx`` / ``cu_num`` columns), which matters for the
+    merged model_configs tables that carry several architectures.
+    """
     try:
         df = pd.read_csv(csv_path).drop_duplicates()
-        df = df[df["q_dtype_w"] == str(q_dtype_w)]
+        if q_dtype_w is not None and "q_dtype_w" in df.columns:
+            df = df[df["q_dtype_w"] == str(q_dtype_w)]
+        if match_device:
+            from aiter.jit.utils.chip_info import get_cu_num
+            from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+            if "gfx" in df.columns:
+                df = df[df["gfx"] == get_gfx()]
+            if "cu_num" in df.columns:
+                df = df[df["cu_num"].astype(int) == int(get_cu_num())]
         return set(zip(df["N"].astype(int), df["K"].astype(int), df["M"].astype(int)))
     except Exception:
         return set()
 
 
-def _check_kernel_tuned(N: int, K: int, q_dtype_w: torch.dtype, csv_path: str) -> bool:
-    configs = _load_gemm_tuned_configs(q_dtype_w, csv_path)
+def _check_kernel_tuned(
+    N: int,
+    K: int,
+    q_dtype_w: torch.dtype | None,
+    csv_path: str,
+    match_device: bool = False,
+) -> bool:
+    configs = _load_gemm_tuned_configs(q_dtype_w, csv_path, match_device)
     l_m = (
         [1, 2, 4]
         + list(range(8, 513, 8))
@@ -3084,34 +3106,16 @@ class rocm_aiter_ops:
         ]
 
     @staticmethod
-    @functools.cache
     def is_bpreshuffle_blockscale_gemm_tuned(n: int, k: int) -> bool:
         """Whether AITER's merged a8w8_blockscale_bpreshuffle tuned table has
-        rows for this (N, K) on the current GPU (gfx + CU count). Mirrors
-        is_triton_gemm_w8a8_tuned: untuned shapes would fall to the C++
-        default-heuristic instance, which can lose to the Triton path at small M,
-        so the b-preshuffle backend is only selected for covered shapes."""
-        try:
-            from aiter import AITER_CONFIGS
-            from aiter.jit.utils.chip_info import get_cu_num
-            from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+        rows for this (N, K) on the current GPU. Mirrors is_triton_gemm_w8a8_tuned:
+        untuned shapes would fall to the C++ default-heuristic instance, which can
+        lose to the Triton path at small M, so the b-preshuffle backend is only
+        selected for covered shapes."""
+        from aiter import AITER_CONFIGS
 
-            csv_path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-            df = pd.read_csv(csv_path)
-            if "gfx" in df.columns:
-                df = df[df["gfx"] == get_gfx()]
-            if "cu_num" in df.columns:
-                df = df[df["cu_num"].astype(int) == int(get_cu_num())]
-            return bool(((df["N"].astype(int) == n) & (df["K"].astype(int) == k)).any())
-        except Exception as e:  # noqa: BLE001
-            logger.warning_once(
-                "Could not read the AITER bpreshuffle tuned table (%r); treating "
-                "(N=%d, K=%d) as untuned.",
-                e,
-                n,
-                k,
-            )
-            return False
+        csv_path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+        return _check_kernel_tuned(n, k, None, csv_path, match_device=True)
 
     @staticmethod
     def is_shuffled_per_token_w8a8_gemm_tuned(
