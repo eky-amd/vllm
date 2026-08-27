@@ -970,6 +970,26 @@ def _rocm_aiter_fused_allreduce_rmsnorm_fake(
     return torch.empty_like(input_), torch.empty_like(residual)
 
 
+_FUSED_AR_QUANT_TRANSPOSE_SUPPORTED: bool | None = None
+
+
+def _fused_ar_quant_supports_transpose_scale() -> bool:
+    """Whether this AITER build's ``fused_allreduce_rmsnorm_quant_per_group``
+    pybind accepts the trailing ``transpose_scale`` flag (added after the 0.1.19
+    release wheel). Probed once from the registered op schema."""
+    global _FUSED_AR_QUANT_TRANSPOSE_SUPPORTED
+    if _FUSED_AR_QUANT_TRANSPOSE_SUPPORTED is None:
+        try:
+            import aiter  # noqa: F401  (registers torch.ops.aiter)
+
+            op = torch.ops.aiter.fused_allreduce_rmsnorm_quant_per_group
+            schema = str(getattr(op, "default", op)._schema)
+            _FUSED_AR_QUANT_TRANSPOSE_SUPPORTED = "transpose_scale" in schema
+        except Exception:
+            _FUSED_AR_QUANT_TRANSPOSE_SUPPORTED = False
+    return _FUSED_AR_QUANT_TRANSPOSE_SUPPORTED
+
+
 def _aiter_fused_ar_rms_per_group_quant_transposed(
     ca,
     inp: torch.Tensor,
@@ -1054,7 +1074,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
 
     use_1stage = hidden_ok and token_ok and size_ok
 
-    if transpose_scale:
+    if transpose_scale and _fused_ar_quant_supports_transpose_scale():
         result = _aiter_fused_ar_rms_per_group_quant_transposed(
             ca, input_, residual, weight, epsilon, group_size, use_1stage
         )
@@ -1069,7 +1089,12 @@ def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl(
             use_1stage=use_1stage,
         )
     assert result is not None
-    return result[0], result[1], result[2]
+    out, res_out, scale = result[0], result[1], result[2]
+    if transpose_scale and not _fused_ar_quant_supports_transpose_scale():
+        # AITER build without the in-kernel transposed-scale mode (e.g. the
+        # 0.1.19 release wheel): emit the column-major-bytes layout here.
+        scale = scale.transpose(0, 1).contiguous().view(scale.shape)
+    return out, res_out, scale
 
 
 def _rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_fake(
