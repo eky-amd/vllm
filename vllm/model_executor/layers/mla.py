@@ -125,6 +125,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             topk_indices_buffer=mla_modules.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+        # Decode-only rope + KV-cache write + fp8 query assembly fusion (AITER);
+        # the layer takes over rope when it is active (see forward below).
+        self.mla_attn.attach_rotary_emb(self.rotary_emb)
         indexer_op = getattr(self.indexer, "indexer_op", None)
         if indexer_op is not None and hasattr(
             indexer_op, "dense_mha_metadata_layer_name"
@@ -197,7 +200,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             heads *= q_proj_layer.group_size
         q = q.view(-1, heads, self.qk_head_dim)
 
-        if self.rotary_emb is not None:
+        fused_rope_cache = self.mla_attn.fused_qk_rope_cache_mla
+        if self.rotary_emb is not None and not fused_rope_cache:
             q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
             )
@@ -218,6 +222,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             q_dcp_replicated=q_dcp_replicated,
+            positions=positions if fused_rope_cache else None,
         )
 
         if self.g_proj is not None:
