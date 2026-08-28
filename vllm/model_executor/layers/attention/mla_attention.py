@@ -708,8 +708,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         q_pe = q[..., self.qk_nope_head_dim :]
         if layer_slot_mapping is not None and raw_kv_cache.numel() > 0:
-            # one launch: rope(q_pe, k_pe) + fp8 cache write of [kv_c | k_pe]
-            k_pe = k_pe.squeeze(1).contiguous()
+            # one launch: rope(q_pe, k_pe) + fp8 cache write of [kv_c | k_pe]; the
+            # kernel takes strides, so the strided [T, pe] split view is fine as is
+            k_pe = k_pe.squeeze(1)
             ops.concat_and_cache_mla_rope_fused(
                 positions,
                 q_pe,
