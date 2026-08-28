@@ -50,7 +50,7 @@ def _run():
     cache_f = torch.zeros_like(cache_store).view(fp8)
     q_out = torch.empty(B, N, L + P, device=dev, dtype=fp8)
     cos, sin = rope.cos_sin_cache.chunk(2, dim=-1); cos = cos.contiguous(); sin = sin.contiguous()
-    rocm_aiter_ops.fused_qk_rope_concat_and_cache_mla(ql_nope, q_pe, kv_c, k_pe.squeeze(1), cache_f.view(NB, -1, L + P), q_out,
+    rocm_aiter_ops.fused_qk_rope_concat_and_cache_mla(ql_nope, q_pe, kv_c, k_pe.squeeze(1), cache_f.view(-1, 1, L + P), q_out,
                                                       slot_mapping, k_scale, q_scale, positions, cos, sin, is_neox=rope.is_neox_style)
     torch.cuda.synchronize()
     def cmp(name, a, b, exact=False):

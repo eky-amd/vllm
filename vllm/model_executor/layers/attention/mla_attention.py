@@ -698,22 +698,33 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill / mixed batch (or no cache yet): do what the wrapper and
-        unified_mla_kv_cache_update would have done. Returns the rotated k_pe."""
+        """Prefill / mixed batch (or no cache yet): what the wrapper's rope +
+        unified_mla_kv_cache_update (fused by the fuse_rope_kvcache_cat_mla pass
+        into concat_and_cache_mla_rope_fused) would have done. Rotates q_pe in
+        place and returns the rotated k_pe."""
         assert self.rotary_emb is not None
-        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim :], k_pe
+        _, _, raw_kv_cache, layer_slot_mapping = get_attention_context(
+            self.layer_name
         )
-        _, _, _, layer_slot_mapping = get_attention_context(self.layer_name)
-        if layer_slot_mapping is not None:
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                k_c_normed,
+        q_pe = q[..., self.qk_nope_head_dim :]
+        if layer_slot_mapping is not None and raw_kv_cache.numel() > 0:
+            # one launch: rope(q_pe, k_pe) + fp8 cache write of [kv_c | k_pe]
+            k_pe = k_pe.squeeze(1).contiguous()
+            ops.concat_and_cache_mla_rope_fused(
+                positions,
+                q_pe,
                 k_pe,
-                kv_cache,
+                k_c_normed,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.is_neox_style,
                 layer_slot_mapping,
+                raw_kv_cache.squeeze(1) if raw_kv_cache.dim() == 4 else raw_kv_cache,
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            return k_pe.unsqueeze(1)
+        # no cache yet (profiling run): rope only
+        q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(positions, q_pe, k_pe)
         return k_pe
 
     def _fused_qk_rope_concat_and_cache(
@@ -737,12 +748,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         _, _, _, layer_slot_mapping = get_attention_context(self.layer_name)
         cos, sin = self._fused_rope_cos_sin(ql_nope.dtype)
+        # The cache is a contiguous [num_blocks, block_size, L+P] fp8 tensor, so
+        # slot s lives at s*(L+P) regardless of the block size. Presenting it as
+        # [num_slots, 1, L+P] (block_size 1, ATOM's MLA page size) makes AITER
+        # take its per-head decode kernel (~4 us) instead of the general one
+        # (~6 us); the addressing is identical for both.
         rocm_aiter_ops.fused_qk_rope_concat_and_cache_mla(
             ql_nope,
             q_pe,
             kv_c,
             k_pe.squeeze(1),
-            kv_cache.view(kv_cache.shape[0], -1, L + P),
+            kv_cache.view(-1, 1, L + P),
             q_out,
             layer_slot_mapping,
             self._k_scale,
