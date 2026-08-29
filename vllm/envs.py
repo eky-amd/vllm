@@ -141,6 +141,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_FUSED_QK_ROPE_CACHE_MLA: bool = False
+    VLLM_ROCM_NUMA_BIND_WORKERS: bool = False
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
@@ -1289,6 +1290,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_FUSED_QK_ROPE_CACHE_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FUSED_QK_ROPE_CACHE_MLA", "False").lower()
         in ("true", "1")
+    ),
+    # Bind each GPU worker process (CPU affinity + preferred memory node) to the
+    # NUMA node of its GPU from inside the worker, without numactl. On a 2-socket
+    # MI355X host an unbound worker scheduled on the remote node launches every
+    # kernel across the socket: ~1 us per launch, i.e. 15-30 % on the ~5 us
+    # kernels of a DeepSeek decode layer, and the fast ranks then wait in the
+    # all-reduce for the slow ones (~0.5-0.9 ms per decode step at TP8).
+    "VLLM_ROCM_NUMA_BIND_WORKERS": lambda: (
+        os.getenv("VLLM_ROCM_NUMA_BIND_WORKERS", "False").lower() in ("true", "1")
     ),
     # Small-head (<16) AITER MLA decode kernel selection. Small head counts
     # (e.g. Kimi-K3: 12 heads/rank at TP8, 6 at TP16) can decode either through

@@ -381,6 +381,16 @@ class Worker(WorkerBase):
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
 
+            if envs.VLLM_ROCM_NUMA_BIND_WORKERS and current_platform.is_rocm():
+                # Pin this worker to its GPU's NUMA node before any large
+                # allocation / NCCL init so threads inherit the mask and memory
+                # is first-touched locally (see envs.VLLM_ROCM_NUMA_BIND_WORKERS).
+                from vllm.utils.numa_utils import bind_current_process_to_gpu_numa_node
+
+                bind_current_process_to_gpu_numa_node(
+                    visible_device_index, label=f"rank {self.rank}"
+                )
+
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
             # Initialize the distributed environment BEFORE taking

@@ -601,3 +601,68 @@ def _mp_set_executable(executable: str, debug_str: str):
             f"expected {executable}, got {multiprocessing.spawn.get_executable()}"
         )
         multiprocessing.spawn.set_executable(old_executable)
+
+
+def _numa_node_cpus(node: int) -> set[int]:
+    """CPUs of a NUMA node from sysfs (e.g. "0-63,128-191")."""
+    cpus: set[int] = set()
+    with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+        for part in f.read().strip().split(","):
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-")
+                cpus.update(range(int(a), int(b) + 1))
+            else:
+                cpus.add(int(part))
+    return cpus
+
+
+def bind_current_process_to_gpu_numa_node(device_index: int, label: str = "") -> None:
+    """Pin the calling process (all threads) to the CPUs of its GPU's NUMA node and
+    prefer that node for new allocations. In-process alternative to the numactl
+    wrapper used by ``configure_subprocess``; needs no external binary and respects
+    an existing cpuset. Best effort: logs and returns on any failure."""
+    from vllm.platforms import current_platform
+
+    tag = f" ({label})" if label else ""
+    try:
+        nodes = current_platform.get_all_device_numa_nodes()
+        if not nodes or device_index >= len(nodes) or nodes[device_index] is None:
+            logger.warning(
+                "NUMA bind%s: could not resolve the NUMA node of device %d; skipping.",
+                tag,
+                device_index,
+            )
+            return
+        node = int(nodes[device_index])
+        if node < 0:
+            logger.warning(
+                "NUMA bind%s: device %d reports NUMA node %d; skipping.",
+                tag,
+                device_index,
+                node,
+            )
+            return
+        cpus = _numa_node_cpus(node) & os.sched_getaffinity(0)
+        if not cpus:
+            logger.warning(
+                "NUMA bind%s: node %d has no CPUs in the current affinity; skipping.",
+                tag,
+                node,
+            )
+            return
+        os.sched_setaffinity(0, cpus)
+        try:
+            import ctypes
+
+            libnuma = ctypes.CDLL("libnuma.so.1")
+            if libnuma.numa_available() >= 0:
+                libnuma.numa_set_preferred(ctypes.c_int(node))
+        except Exception as e:  # libnuma optional: first-touch on pinned CPUs is local anyway
+            logger.debug("NUMA bind%s: numa_set_preferred skipped: %s", tag, e)
+        logger.info(
+            "NUMA bind%s: device %d -> node %d (%d CPUs)", tag, device_index, node, len(cpus)
+        )
+    except Exception as e:
+        logger.warning("NUMA bind%s failed for device %d: %s", tag, device_index, e)
