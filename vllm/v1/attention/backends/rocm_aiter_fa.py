@@ -44,29 +44,51 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 _PA_GLUON_MAX_QUERY_LEN = 4
 _PA_GLUON_MAX_QUERY_GROUP_SIZE = 64
-# Query group sizes the gluon paged-attention decode kernel is validated for: 8, 16
-_PA_GLUON_QUERY_GROUP_SIZES = (8, 16)
-
-# The kernel is only validated for this head size and kernel block size.
-_PA_GLUON_HEAD_SIZE = 128
-_PA_GLUON_BLOCK_SIZE = 128
+# Head size 128: query group sizes the gluon paged-attention decode kernel is
+# validated for on 128-token pages (MiniMax-M3). Other group sizes at head 128
+# stay on the asm/ll4mi paged-attention kernels, which only serve head 128.
+_PA_GLUON_HEAD128_QUERY_GROUP_SIZES = (8, 16)
+_PA_GLUON_HEAD128_BLOCK_SIZES = (128,)
+# Head sizes the asm/ll4mi kernels cannot take, so gluon is the only paged
+# decode kernel for them in the shuffle layout: any GQA group whose extent fits
+# the kernel's 64-row limit, on the kernel block sizes AITER validates for its
+# persistent-scheduler path (16, 64) plus the 128-token page used above. This
+# is the configuration ATOM runs for Qwen3.5/3.8 dense attention (24 q / 4 kv
+# heads, head 256, 16-token pages).
+_PA_GLUON_LARGE_HEAD_SIZES = (256,)
+_PA_GLUON_LARGE_HEAD_BLOCK_SIZES = (16, 64, 128)
 
 
 def _pa_gluon_supports(num_heads_q: int, num_heads_kv: int, head_size: int) -> bool:
     """Whether the head config can use the PA decode gluon kernel.
 
     Requires the shuffle KV cache layout (the kernel reads K/V in that layout)
-    plus a head config the kernel is validated for. Both the advertised kernel
-    block sizes and the decode dispatch go through this, so a config can never
-    be offered a 128-token page that gluon will then decline to serve.
+    plus a head config the kernel is known to serve. Both the advertised kernel
+    block sizes and the decode dispatch go through this (with
+    ``_pa_gluon_block_sizes`` for the page), so a config can never be offered a
+    page that gluon will then decline to serve.
     """
-    return (
+    if not (
         rocm_aiter_ops.is_shuffle_kv_cache_enabled()
         and num_heads_kv > 0
         and num_heads_q % num_heads_kv == 0
-        and num_heads_q // num_heads_kv in _PA_GLUON_QUERY_GROUP_SIZES
-        and head_size == _PA_GLUON_HEAD_SIZE
+    ):
+        return False
+    group = num_heads_q // num_heads_kv
+    if head_size == 128:
+        return group in _PA_GLUON_HEAD128_QUERY_GROUP_SIZES
+    return (
+        head_size in _PA_GLUON_LARGE_HEAD_SIZES
+        and 1 <= group <= _PA_GLUON_MAX_QUERY_GROUP_SIZE
     )
+
+
+def _pa_gluon_block_sizes(head_size: int) -> tuple[int, ...]:
+    """Kernel block sizes the gluon decode kernel is dispatched for at this
+    head size (see ``_pa_gluon_supports``)."""
+    if head_size == 128:
+        return _PA_GLUON_HEAD128_BLOCK_SIZES
+    return _PA_GLUON_LARGE_HEAD_BLOCK_SIZES
 
 
 _PARTITION_SIZE_ROCM = 256
@@ -857,7 +879,8 @@ class AiterFlashAttentionBackend(AttentionBackend):
             return [16, 32]
         # Only gluon serves 128-token pages; the pa_fwd_asm/ll4mi decode
         # fallback is limited to 16 and 32. Advertise 128 only when gluon can
-        # run so selection never picks a page we cannot serve.
+        # run so selection never picks a page we cannot serve. (16 is served
+        # by gluon too where _pa_gluon_block_sizes allows it, e.g. head 256.)
         vllm_config = get_current_vllm_config_or_none()
         if vllm_config is not None and vllm_config.model_config is not None:
             mc = vllm_config.model_config
@@ -1365,7 +1388,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     _pa_gluon_supports(
                         self.num_heads, self.num_kv_heads, self.head_size
                     )
-                    and key_cache.shape[1] == _PA_GLUON_BLOCK_SIZE
+                    and key_cache.shape[1] in _pa_gluon_block_sizes(self.head_size)
                     and decode_query_len is not None
                     and decode_query_len <= _PA_GLUON_MAX_QUERY_LEN
                     and decode_query_len * (self.num_heads // self.num_kv_heads)

@@ -329,6 +329,47 @@ def test_aiter_mha_backend_validates_kv_cache_block_size():
     )
 
 
+@pytest.mark.parametrize(
+    "num_heads_q, num_heads_kv, head_size, shuffle, expected",
+    [
+        # head 128: only the validated MiniMax-M3 groups; other groups keep the
+        # asm/ll4mi paged-attention kernels
+        (8, 1, 128, True, True),
+        (16, 1, 128, True, True),
+        (64, 4, 128, True, True),
+        (4, 1, 128, True, False),
+        (32, 8, 128, True, False),
+        # head 256 (asm/ll4mi cannot take it): any GQA group up to 64 rows,
+        # e.g. Qwen3.5/3.8 dense attention 24 q / 4 kv heads
+        (24, 4, 256, True, True),
+        (32, 8, 256, True, True),
+        (64, 1, 256, True, True),
+        (80, 1, 256, True, False),
+        (25, 4, 256, True, False),
+        # head 64 is left to the other kernels
+        (8, 1, 64, True, False),
+        # never without the shuffle KV cache layout the kernel reads
+        (24, 4, 256, False, False),
+        (8, 1, 128, False, False),
+    ],
+)
+def test_pa_gluon_gate(
+    monkeypatch, num_heads_q, num_heads_kv, head_size, shuffle, expected
+):
+    """The gluon paged-decode gate: validated head-128 groups on 128-token
+    pages, and every fitting GQA group at head 256 on 16/64/128-token pages."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.backends.rocm_aiter_fa import (
+        _pa_gluon_block_sizes,
+        _pa_gluon_supports,
+    )
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_shuffle_kv_cache_enabled", lambda: shuffle)
+    assert _pa_gluon_supports(num_heads_q, num_heads_kv, head_size) is expected
+    assert _pa_gluon_block_sizes(128) == (128,)
+    assert _pa_gluon_block_sizes(256) == (16, 64, 128)
+
+
 def test_aiter_mha_backend_supports_compute_capability_matches_mi3xx_probe():
     """The backend should trust the ROCm MI3xx probe instead of the raw torch
     capability tuple."""
