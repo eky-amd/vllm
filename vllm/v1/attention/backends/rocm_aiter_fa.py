@@ -515,6 +515,13 @@ class AiterFlashAttentionMetadataBuilder(
             if layer.kv_sharing_target_layer_name is not None:
                 kv_sharing_shape = (layer.impl.num_kv_heads, layer.impl.head_size)
 
+        # Layers whose decode may run through the gluon kernel; their null
+        # block is cleared before every decode step (see _zero_gluon_null_block).
+        self._gluon_null_block_layers: list[Attention] = (
+            [layer for name, layer in layers.items() if name in layer_names]
+            if _pa_gluon_supports(self.num_heads_q, self.num_heads_kv, self.headdim)
+            else []
+        )
         while len(sliding_window_configs) > 0:
             sliding_window_config = sliding_window_configs.pop()
             if sliding_window_config is not None and sliding_window_config[0] != -1:
@@ -549,6 +556,26 @@ class AiterFlashAttentionMetadataBuilder(
         return self.build(
             common_prefix_len=0, common_attn_metadata=common_attn_metadata
         )
+
+    def _zero_gluon_null_block(self) -> None:
+        """Clear block 0 of every layer's KV cache before a gluon decode.
+
+        AITER's gluon paged-decode kernel loads the V tile of masked positions
+        without zero-filling it, so a NaN anywhere in a loaded row reaches the
+        output as NaN * 0. Positions past a request's last block resolve
+        through the zero-padded block table to block 0, the null block, which
+        real requests never allocate (so it is never zeroed for them) and
+        which warmup dummy runs write into. Clearing it every decode step is
+        one multi-tensor launch per attention group and keeps those masked
+        rows finite until the kernel masks its loads.
+        """
+        blocks = [
+            layer.kv_cache[0]
+            for layer in self._gluon_null_block_layers
+            if isinstance(layer.kv_cache, torch.Tensor) and layer.kv_cache.numel() > 0
+        ]
+        if blocks:
+            torch._foreach_zero_(blocks)
 
     def build(
         self,
@@ -620,6 +647,8 @@ class AiterFlashAttentionMetadataBuilder(
 
         decode_metadata = None
         if num_decodes > 0:
+            if self._gluon_null_block_layers:
+                self._zero_gluon_null_block()
             decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
             uniform_query_len = (
                 decode_max_query_len
@@ -816,6 +845,8 @@ class AiterFlashAttentionMetadataBuilder(
                 common_prefix_len=0, common_attn_metadata=common_attn_metadata
             )
 
+        if self._gluon_null_block_layers:
+            self._zero_gluon_null_block()
         decode_metadata = AiterFlashAttentionDecodeMetadata(
             max_query_len=max_query_len,
             uniform_query_len=(
