@@ -54,6 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
@@ -117,6 +118,16 @@ class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
         return self.ctx.get_hf_config((Qwen3_5MoeConfig, Qwen3_5MoeTextConfig))
 
 
+def fuse_gdn_in_proj(vllm_config: VllmConfig) -> bool:
+    """One GEMM for the GDN in_proj_qkvz and in_proj_ba: ROCm, unquantized,
+    no LoRA (Qwen3.5 checkpoints store q/k/v/z/b/a as separate weights)."""
+    return (
+        current_platform.is_rocm()
+        and vllm_config.quant_config is None
+        and vllm_config.lora_config is None
+    )
+
+
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     def __init__(
         self,
@@ -148,6 +159,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
                 reduce_results=not self.use_attn_reduce_scatter_for_moe,
+                fuse_in_proj=fuse_gdn_in_proj(vllm_config),
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
@@ -262,6 +274,16 @@ class Qwen3_5Model(Qwen3NextModel):
             Qwen3NextSparseMoeBlock,
             "mlp",
         )
+        # Fused GDN input projection: b/a load as shards 4/5 of in_proj_qkvz.
+        if fuse_gdn_in_proj(vllm_config):
+            self.hf_to_vllm_mapper = Qwen3NextModel.hf_to_vllm_mapper | WeightsMapper(
+                orig_to_new_stacked={
+                    ".in_proj_qkv": (".in_proj_qkvz", (0, 1, 2)),
+                    ".in_proj_z": (".in_proj_qkvz", 3),
+                    ".in_proj_b": (".in_proj_qkvz", 4),
+                    ".in_proj_a": (".in_proj_qkvz", 5),
+                }
+            )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
